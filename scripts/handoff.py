@@ -29,8 +29,10 @@ VERDICT_NAME = "校对/交接/verdict.json"
 
 CLUSTERS = [
     ("丢否定", r"否定|不是|不|没|别|未|反转"),
-    ("程度词丢失", r"程度|限定|大概|左右|几乎|稍微|都|才"),
-    ("补了原文没有的内容", r"新增|补|添加|原文没有|编造|例子"),
+    ("实词替换", r"校长|老师|机构|平台|行业|换成|改成|实词"),
+    ("补了原文没有的内容", r"新增|补|添加|原文没有|编造|例子|资料|文档"),
+    ("缩写或专名误判", r"缩写|专名|术语|黑话|品牌|IP|平台名"),
+    ("程度词丢失", r"程度|限定|大概|左右|几乎|稍微"),
     ("漏义", r"漏|丢|删掉|省略|缺"),
     ("其他", r""),
 ]
@@ -83,8 +85,25 @@ def build(project: Path) -> int:
             "| 编造 | 出现原文没有的信息、例子、结论、背景 | 原文没提数字，整理后补了具体金额 |",
             "| 漏义 | 丢掉关键意思，尤其否定、限定、程度 | 「不全是」被写成「都是」 |",
             "| 反转 | 意思说反 | 「不适合补差」被写成「适合补差」 |",
+            "| 实词替换 | 把某个实词换成另一个实词 | 「校长」被改成「指令」、「教培」被改成「体培」 |",
+            "| 缩写误判 | 对乱码缩写强行猜测 | 「埃批」被猜成「LBP」，正确是「IP」 |",
         ]
     )
+
+    glossary_path = project / "校对" / "术语表.csv"
+    glossary_block = ""
+    if glossary_path.exists():
+        import csv as _csv
+
+        with glossary_path.open(encoding="utf-8-sig") as fh:
+            terms = [r["词"] for r in _csv.DictReader(fh) if r.get("词")]
+        if terms:
+            glossary_block = (
+                "\n## 四之前：术语表（重要）\n\n"
+                "下列写法在语料中已确认，**属于术语修正，不算编造**：\n\n"
+                + "、".join(terms[:80])
+                + "\n"
+            )
 
     task = f"""# 审核任务：核对 {project.name} 的文案整理结果
 
@@ -115,9 +134,10 @@ def build(project: Path) -> int:
 
 ## 四、怎么判
 
-只判断三件事有没有发生：
+只判断这几件事有没有发生：
 
 {cards}
+{glossary_block}
 
 ## 五、输出
 
@@ -130,17 +150,30 @@ def build(project: Path) -> int:
   "items": [
     {{"order": "013", "id": "7660476565372931364", "para": 5, "verdict": "pass", "reason": ""}},
     {{"order": "013", "id": "7660476565372931364", "para": 8, "verdict": "rollback",
-      "reason": "把「不全是」改成「都是」，否定被丢"}}
+      "reason": "把「不全是」改成「都是」，否定被丢"}},
+    {{"order": "013", "id": "7660476565372931364", "para": 12, "verdict": "correct",
+      "text": "这一段正确的完整文字", "reason": "校对把「埃批」猜成 LBP，应为 IP"}}
   ]
 }}
 ```
 
+`verdict` 三选一：
+
+| 值 | 含义 |
+|---|---|
+| `pass` | 校对没问题 |
+| `rollback` | 校对改错了，退回原文 |
+| `correct` | 校对方向对但改错了，**你直接给出正确写法**（必须带 `text`） |
+
+优先用 `correct`：像「埃批→LBP」这种，退回「埃批」是浪费，直接给「IP」才有用。
+
 要求：
 
 1. **直接写入文件**，不要只贴在回复里
-2. `verdict` 只能是 `pass` 或 `rollback`
-3. `reason` 控制在 20 字内，`pass` 可以留空
-4. 每一条待审段都要出现一条结论，不要漏
+2. `reason` 控制在 20 字内，`pass` 可以留空
+3. 每一条待审段都要出现一条结论，不要漏
+4. 条目很多时可以分片写 `verdict-part-1.jsonl`、`verdict-part-2.jsonl`，
+   每行一个 item，程序会自动合并
 
 ## 六、位置说明
 
@@ -173,18 +206,43 @@ def check(project: Path) -> int:
     pairs = [json.loads(l) for l in pairs_path.read_text(encoding="utf-8").splitlines() if l.strip()]
     key = {(p["order"], p["id"], p["para"]) for p in pairs}
 
-    if not verdict_path.exists():
+    shards = sorted((project / "校对" / "交接").glob("verdict-part-*"))
+    if not verdict_path.exists() and not shards:
         print(f"还没检测到审核结果：{VERDICT_NAME}")
         print("如果外部 Agent 已跑完，请确认它把 verdict.json 写到了 校对/交接/ 下。")
         return 1
 
-    try:
-        data = json.loads(verdict_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as error:
-        print(f"verdict.json 无法解析：{error}")
-        return 2
+    items: list[dict] = []
+    data: dict = {}
+    if verdict_path.exists():
+        try:
+            data = json.loads(verdict_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            print(f"verdict.json 无法解析：{error}")
+            return 2
+        items.extend(data.get("items") or [])
 
-    items = data.get("items") or []
+    # 分片结果自动合并：verdict-part-*.jsonl（一行一条）或 *.json（含 items）
+    for shard in shards:
+        try:
+            text = shard.read_text(encoding="utf-8")
+            if shard.suffix == ".jsonl":
+                for line in text.splitlines():
+                    if line.strip():
+                        items.append(json.loads(line))
+            else:
+                payload = json.loads(text)
+                items.extend(payload.get("items") or [])
+        except json.JSONDecodeError:
+            print(f"跳过无法解析的分片：{shard.name}")
+
+    # 同 key 多次出现时，以最后一条为准
+    merged: dict[tuple, dict] = {}
+    for entry in items:
+        k = (str(entry.get("order")), str(entry.get("id")), entry.get("para"))
+        merged[k] = entry
+    items = list(merged.values())
+
     valid, dropped, bad_value = [], 0, 0
     for entry in items:
         k = (str(entry.get("order")), str(entry.get("id")), entry.get("para"))
@@ -192,7 +250,10 @@ def check(project: Path) -> int:
             dropped += 1
             continue
         verdict = entry.get("verdict")
-        if verdict not in {"pass", "rollback"}:
+        if verdict == "correct" and not str(entry.get("text") or "").strip():
+            bad_value += 1
+            verdict = "rollback"
+        elif verdict not in {"pass", "rollback", "correct"}:
             bad_value += 1
             verdict = "pass"
         valid.append({**entry, "verdict": verdict})
@@ -202,7 +263,9 @@ def check(project: Path) -> int:
     unjudged = len(expected - judged)
 
     rollbacks = [i for i in valid if i["verdict"] == "rollback"]
-    total, rolled = len(valid), len(rollbacks)
+    corrections = [i for i in valid if i["verdict"] == "correct"]
+    total = len(valid)
+    rolled = len(rollbacks) + len(corrections)
     rate = rolled / max(1, total)
 
     clusters = Counter(cluster(i.get("reason") or "") for i in rollbacks)
@@ -232,13 +295,20 @@ def check(project: Path) -> int:
         decision = "ask"
         reasons.append(f"回滚率 {rate:.1%}，需你确认")
 
+    # 复核优先级：理由聚类最大的那类 + 段落最长的，优先人看
+    def _len(entry: dict) -> int:
+        return len(entry.get("after") or "")
+
+    top = sorted(rollbacks, key=lambda e: -_len(e))[:20]
+
     summary = {
         "auditorModel": data.get("auditorModel", ""),
         "auditedAt": data.get("auditedAt", ""),
         "待审段": len(pairs),
         "已判定": total,
         "通过": total - rolled,
-        "回滚": rolled,
+        "回滚": len(rollbacks),
+        "给正解": len(corrections),
         "回滚率": round(rate, 4),
         "未审段": unjudged,
         "未审率": round(unjudged_rate, 4),
@@ -254,7 +324,7 @@ def check(project: Path) -> int:
     )
 
     print("【审核回执】")
-    print(f"待审 {len(pairs)} 段 ｜ 已判 {total} ｜ 通过 {total - rolled} ｜ 回滚 {rolled}（{rate:.1%}）")
+    print(f"待审 {len(pairs)} 段 ｜ 已判 {total} ｜ 通过 {total - rolled} ｜ 回滚 {len(rollbacks)} ｜ 给正解 {len(corrections)}（合计 {rate:.1%}）")
     print(f"审核者：{data.get('auditorModel') or '未注明'} ｜ 未审 {unjudged} 段（{unjudged_rate:.0%}）")
     if dropped or bad_value:
         print(f"异常：无法匹配 {dropped} 条，非法取值 {bad_value} 条")
@@ -266,6 +336,10 @@ def check(project: Path) -> int:
         print("回滚集中篇目：")
         for order, r, t in heavy[:5]:
             print(f"  #{order} 回滚 {r}/{t} 段")
+    if top:
+        print("建议优先复核（按段落长度排序，前 5）：")
+        for entry in top[:5]:
+            print(f"  #{entry['order']} 段{entry['para']}：{(entry.get('after') or '')[:40]}…")
     print(f"决策：{decision}" + (f"（{'；'.join(reasons)}）" if reasons else "（可自动继续 G4）"))
     return 0
 

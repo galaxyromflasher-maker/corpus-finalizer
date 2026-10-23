@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import threading
 import time
@@ -59,9 +60,15 @@ SYSTEM = """你在整理一段视频口播的字幕稿。输入是按顺序编�
 
 
 def load_key(args) -> str:
-    if args.key:
+    """优先级：--key > 环境变量 DSK > --key-file。DSK 不落盘、不进命令行历史。"""
+    if getattr(args, "key", None):
         return args.key.strip()
-    return Path(args.key_file).read_text(encoding="utf-8").strip()
+    env = os.environ.get("DSK", "").strip()
+    if env:
+        return env
+    if getattr(args, "key_file", None):
+        return Path(args.key_file).read_text(encoding="utf-8").strip()
+    raise SystemExit("必须提供 --key、环境变量 DSK，或 --key-file")
 
 
 def parse_md(text: str) -> tuple[list[str], list[dict]]:
@@ -103,12 +110,15 @@ def sentences(text: str) -> list[str]:
 
 
 class Finalizer:
-    def __init__(self, project: Path, key: str, model: str) -> None:
+    def __init__(self, project: Path, key: str, model: str, no_reflow: bool = False) -> None:
         self.project = project
         self.key = key
         self.model = model
+        self.no_reflow = no_reflow
         self.lock = threading.Lock()
         self.verdicts: dict[tuple[str, str, int], str] = {}
+        self.corrections: dict[tuple[str, str, int], str] = {}
+        self.state_path = project / "校对" / "供AI查阅" / "finalize-state.jsonl"
         self.unchecked = False
         self._load_verdict()
 
@@ -119,7 +129,14 @@ class Finalizer:
             return
         data = json.loads(path.read_text(encoding="utf-8"))
         for entry in data.get("items") or []:
-            self.verdicts[(str(entry["order"]), str(entry["id"]), int(entry["para"]))] = entry["verdict"]
+            key = (str(entry["order"]), str(entry["id"]), int(entry["para"]))
+            verdict = entry.get("verdict")
+            if verdict == "correct" and entry.get("text"):
+                # 审核者直接给出正确写法，采用它而不是退回原文
+                self.verdicts[key] = "correct"
+                self.corrections[key] = str(entry["text"]).strip()
+            else:
+                self.verdicts[key] = verdict if verdict in {"pass", "rollback"} else "pass"
 
     def _call(self, paras: list[dict]) -> list[dict]:
         numbered = "\n".join(f"{i}. {p['text']}" for i, p in enumerate(paras, start=1))
@@ -177,11 +194,17 @@ class Finalizer:
             if verdict == "rollback":
                 rolled_idx.append(i)
                 base.append({"start": d["start"], "end": d["end"], "text": o["text"]})
+            elif verdict == "correct":
+                rolled_idx.append(i)
+                base.append({"start": d["start"], "end": d["end"], "text": self.corrections[(order, wid, i)]})
             else:
                 base.append(d)
 
-        ratio = len(rolled_idx) / max(1, len(base))
-        whole = ratio > ROLLBACK_WHOLE
+        # 分母用「本篇被改动的段」而不是「全部段」：
+        # 只改了 2 段的小篇目被全回滚，不该等同于整篇失败
+        changed_paras = int(item.get("changed") or 0)
+        ratio = len(rolled_idx) / max(1, changed_paras)
+        whole = changed_paras >= 3 and ratio > ROLLBACK_WHOLE
 
         if whole:
             base = orig
@@ -200,6 +223,10 @@ class Finalizer:
             blocks = self._fallback_blocks(base)
             segs = self._fallback_segs(base)
             status = "rolled_back"
+        elif self.no_reflow:
+            blocks = self._fallback_blocks(base)
+            segs = self._fallback_segs(base)
+            status = "no_reflow"
         else:
             try:
                 plan = self._call(base)
@@ -231,12 +258,24 @@ class Finalizer:
                      "chars": len(seg["text"]), "text": seg["text"]},
                     ensure_ascii=False) + "\n")
 
-        meta_path = folder / "meta.json"
-        if meta_path.exists():
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            meta["proofreadStatus"] = "rolled_back" if whole else "finalized"
-            meta["finalizeStatus"] = status
-            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        # 红线 1：不改写 meta.json，状态写阶段文件
+        with self.lock:
+            with self.state_path.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "order": order,
+                            "id": wid,
+                            "proofreadStatus": "rolled_back" if whole else "finalized",
+                            "finalizeStatus": status,
+                            "rolled": len(rolled_idx),
+                            "changed": changed_paras,
+                            "at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
 
         return {
             "order": order, "id": wid, "category": item.get("category", ""), "title": item["title"],
@@ -295,9 +334,17 @@ def main() -> int:
     parser.add_argument("--key-file", default=None)
     parser.add_argument("--model", default="qwen-plus")
     parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument(
+        "--no-reflow",
+        action="store_true",
+        help="跳过段落重排，只做回滚 + 双格式输出。零 API 可跑，不需要 Key",
+    )
     args = parser.parse_args()
 
-    key = load_key(args)
+    if args.no_reflow and not (args.key or os.environ.get("DSK") or args.key_file):
+        key = ""
+    else:
+        key = load_key(args)
     project = Path(args.project).resolve()
     items = [json.loads(l) for l in (project / "校对" / "worklist.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
 
@@ -307,9 +354,11 @@ def main() -> int:
         if d.exists():
             item["changed"] = json.loads(d.read_text(encoding="utf-8"))["stats"]["changed"]
 
-    runner = Finalizer(project, key, args.model)
+    runner = Finalizer(project, key, args.model, no_reflow=args.no_reflow)
     if runner.unchecked:
-        print("未检测到 verdict.json，按「未审核」模式运行（只合并碎段，不去口语）")
+        print("未检测到 verdict.json，按「未审核」模式运行（不回滚，不重排）")
+    if args.no_reflow:
+        print("已启用 --no-reflow：跳过重排，仅回滚 + 输出，全程零 API")
 
     results = []
     with ThreadPoolExecutor(max_workers=args.workers) as pool:

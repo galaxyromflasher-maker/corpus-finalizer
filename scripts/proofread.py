@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import threading
 import time
@@ -41,16 +42,31 @@ SYSTEM = """你是中文语音转写稿的校对员。输入是视频口播的�
 5. 正常口语、重复、口头禅（嗯、啊、那个、就是说、对吧）属于原话，不要改。
 6. 改动必须能被上下文佐证；没有把握就不改。
 
-输出严格 JSON，不要代码块：
-{"changed": true, "text": "校对后的完整段落文本", "note": "一句话说明改了什么；没改则写空"}
-无需改动时：{"changed": false, "text": "原文原样返回", "note": ""}
+最重要的第 7 条：
+7. 遇到疑似识别错乱的缩写、专有名词、行业黑话（例如「埃批」可能是 IP、「册殊」可能是测试、
+   「斗势红」可能是抖音号），如果你不能百分之百确定原词是什么，**必须走 uncertain，不要猜**。
+   宁可保留乱码，也不要写一个"看起来合理"的词。
+   绝对禁止把实词替换成另一个实词（校长→指令、教培→体培、抖音→豆包 这类）。
+   绝对禁止凭空补出原文没有的名词（百万、资料、文档、评论区）。
+
+输出严格 JSON，三选一，不要代码块：
+{"action": "keep"}
+{"action": "fix", "text": "改正后的完整段落，只改同音字与漏字", "note": "改了什么"}
+{"action": "uncertain", "guess": "你猜的原词", "reason": "为什么不能确定"}
 """
 
 
 def load_key(args) -> str:
+    """优先级：--key > 环境变量 DSK > --key-file。
+    DSK 是推荐方式：既不落盘，也不进命令行历史。"""
     if args.key:
         return args.key.strip()
-    return Path(args.key_file).read_text(encoding="utf-8").strip()
+    env = os.environ.get("DSK", "").strip()
+    if env:
+        return env
+    if args.key_file:
+        return Path(args.key_file).read_text(encoding="utf-8").strip()
+    raise SystemExit("必须提供 --key、环境变量 DSK，或 --key-file")
 
 
 def parse_md(text: str) -> tuple[list[str], list[dict]]:
@@ -87,6 +103,8 @@ class Proofreader:
         self.model = model
         self.lock = threading.Lock()
         self.log_path = project / "校对" / "供AI查阅" / "proofread-log.jsonl"
+        self.uncertain_path = project / "校对" / "供AI查阅" / "uncertain.jsonl"
+        self.state_path = project / "校对" / "供AI查阅" / "proofread-state.jsonl"
         self.glossary = self._load_glossary()
 
     def _load_glossary(self) -> list[str]:
@@ -134,19 +152,29 @@ class Proofreader:
             with self.log_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    def _uncertain(self, record: dict) -> None:
+        with self.lock:
+            with self.uncertain_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _state(self, record: dict) -> None:
+        with self.lock:
+            with self.state_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
     def process(self, item: dict) -> dict:
         order, wid = item["order"], item["id"]
         src = self.project / item["normalized"]
         folder = self.project / item["folder"]
         draft_path = folder / "draft.md"
         diff_path = self.project / "校对" / "供AI查阅" / "diff" / f"{order}_{wid}.json"
-        meta_path = folder / "meta.json"
 
         if draft_path.exists() and diff_path.exists():
             return {"order": order, "id": wid, "status": "skip"}
 
         head, paras = parse_md(src.read_text(encoding="utf-8"))
-        changes, stats = [], {"kept": 0, "changed": 0, "rolled_back": 0, "failed": 0, "long": 0}
+        changes = []
+        stats = {"kept": 0, "changed": 0, "uncertain": 0, "rolled_back": 0, "failed": 0, "long": 0}
 
         for index, para in enumerate(paras, start=1):
             before = para["text"]
@@ -160,8 +188,31 @@ class Proofreader:
                 self._log({"order": order, "para": index, "action": "failed", "error": str(error)[:120]})
                 continue
 
+            action = result.get("action")
+            if action is None:  # 兼容旧格式
+                action = "fix" if result.get("changed") else "keep"
+
+            if action == "uncertain":
+                # 不写进 draft，原样保留，单独列清单交人工/审核处理
+                stats["uncertain"] += 1
+                self._uncertain(
+                    {
+                        "order": order,
+                        "id": wid,
+                        "para": index,
+                        "text": before,
+                        "guess": (result.get("guess") or "")[:60],
+                        "reason": (result.get("reason") or "")[:120],
+                    }
+                )
+                continue
+
+            if action != "fix":
+                stats["kept"] += 1
+                continue
+
             after = (result.get("text") or before).strip()
-            if not result.get("changed") or after == before:
+            if after == before:
                 stats["kept"] += 1
                 continue
 
@@ -200,11 +251,16 @@ class Proofreader:
             encoding="utf-8",
         )
 
-        if meta_path.exists():
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            meta["proofreadStatus"] = "drafted"
-            meta["proofreadAt"] = datetime.now().astimezone().isoformat(timespec="seconds")
-            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        # 红线 1：meta.json 属于原始文件，不允许改写。状态改记到阶段状态文件。
+        self._state(
+            {
+                "order": order,
+                "id": wid,
+                "proofreadStatus": "drafted",
+                "changed": stats["changed"],
+                "at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            }
+        )
 
         self._log({"order": order, "id": wid, "action": "done", **stats, "density": density})
         return {"order": order, "id": wid, "status": "ok", **stats, "density": density}

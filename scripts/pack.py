@@ -189,6 +189,23 @@ renderView();
 """
 
 
+def load_states(project: Path) -> dict[str, dict]:
+    """阶段状态从 state.jsonl 读，不再依赖 meta.json（已改为只读）。"""
+    states: dict[str, dict] = {}
+    for name in ("proofread-state.jsonl", "finalize-state.jsonl"):
+        path = project / "校对" / "供AI查阅" / name
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            doc_id = record.get("id")
+            if doc_id:
+                states[doc_id] = {**states.get(doc_id, {}), **record}
+    return states
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", required=True)
@@ -201,6 +218,7 @@ def main() -> int:
 
     worklist = load_worklist(project)
     stats = load_stats(project)
+    states = load_states(project)
 
     out = project / f"阅读包-{date}"
     out.mkdir(parents=True, exist_ok=True)
@@ -218,10 +236,7 @@ def main() -> int:
         head, paras = parse_human(human.read_text(encoding="utf-8"))
         url = f"https://www.douyin.com/video/{item['id']}"
         digg = (stats.get(item["id"]) or {}).get("点赞数", "")
-        meta_path = folder / "meta.json"
-        status = "ok"
-        if meta_path.exists():
-            status = json.loads(meta_path.read_text(encoding="utf-8")).get("proofreadStatus", "ok")
+        status = states.get(item["id"], {}).get("proofreadStatus", "ok")
 
         doc = {
             "id": item["id"], "order": item["order"], "category": item.get("category", ""),
